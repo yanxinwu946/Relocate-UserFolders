@@ -14,7 +14,7 @@
     要处理的用户目录，默认当前用户。指定其他路径可迁移别的账户或做沙箱测试。
 
 .PARAMETER TargetRoot
-    目标根目录，每个文件夹落到 <TargetRoot>\<名称>。
+    必填。目标根目录，每个文件夹落到 <TargetRoot>\<名称>。
 
 .PARAMETER Folders
     要迁移的文件夹名，默认六个标准用户目录。
@@ -25,12 +25,17 @@
 .PARAMETER Undo
     回滚：删除联接并把内容搬回用户目录。
 
+.PARAMETER AdoptExisting
+    目标位置已有同名目录时默认中止。脚本能认出自己上次迁过哪些目录（靠目标根下的
+    标记文件），但认不出来的是你自己建的还是别处拷来的，只能由你确认。
+    加这个开关表示"这些目录我知道，合并进去"。
+
 .PARAMETER SyncShellFolders
     顺带改写注册表 Shell Folders，让资源管理器属性页显示真实位置。
     联接本身已覆盖所有路径解析，此开关纯粹为了界面一致，需重新登录生效。
 
 .EXAMPLE
-    .\Relocate-UserFolders.ps1
+    .\Relocate-UserFolders.ps1 -TargetRoot 'D:\'
     演练，显示计划。
 
 .EXAMPLE
@@ -38,25 +43,37 @@
     迁移到 D 盘。
 
 .EXAMPLE
-    .\Relocate-UserFolders.ps1 -Folders Downloads,Pictures -Apply
+    .\Relocate-UserFolders.ps1 -TargetRoot 'D:\' -Folders Downloads,Pictures -Apply
     只迁下载和图片。
 
 .EXAMPLE
-    .\Relocate-UserFolders.ps1 -Undo -Apply
+    .\Relocate-UserFolders.ps1 -TargetRoot 'D:\' -Undo -Apply
     回滚。
 #>
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory)]
+    [string]$TargetRoot,
+
     [string]$ProfileRoot = [Environment]::GetFolderPath('UserProfile'),
-    [string]$TargetRoot = 'E:\',
     [string[]]$Folders = @('Desktop', 'Documents', 'Downloads', 'Music', 'Pictures', 'Videos'),
     [switch]$Apply,
     [switch]$Undo,
+    [switch]$AdoptExisting,
     [switch]$SyncShellFolders
 )
 
 $ErrorActionPreference = 'Stop'
 $Results = [System.Collections.Generic.List[object]]::new()
+
+$MarkerPath = Join-Path $TargetRoot '.relocate-userfolders.json'
+$driveRoot = [System.IO.Path]::GetPathRoot($TargetRoot)
+if (-not (Test-Path -LiteralPath $driveRoot)) {
+    throw "目标磁盘不存在：$driveRoot"
+}
+if ($Apply -and -not (Test-Path -LiteralPath $TargetRoot)) {
+    $null = New-Item -ItemType Directory -Path $TargetRoot -Force
+}
 
 # robocopy 用退出码 1 表示"成功复制了文件"，别让它被当成错误
 if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
@@ -115,6 +132,29 @@ function Set-ShellFolder {
     New-ItemProperty -Path "$base\Shell Folders" -Name $value -Value $Path -PropertyType String -Force | Out-Null
 }
 
+# 目标根下的标记文件，记下哪些目录是本工具迁的。目标位置已存在同名目录时，
+# 只有靠它才能分辨"上次迁移的残留"和"用户自己建的"，否则只能中止等人工确认。
+function Read-Marker {
+    if (-not (Test-Path -LiteralPath $MarkerPath)) { return @{} }
+    $json = Get-Content -LiteralPath $MarkerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $table = @{}
+    if ($json.migrated) {
+        foreach ($p in $json.migrated.PSObject.Properties) { $table[$p.Name] = $p.Value }
+    }
+    $table
+}
+
+function Write-Marker {
+    param([hashtable]$Migrated)
+    [ordered]@{
+        version     = 1
+        profileRoot = $ProfileRoot
+        migrated    = $Migrated
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $MarkerPath -Encoding UTF8
+}
+
+$Migrated = Read-Marker
+
 $mode = if ($Undo) { '回滚' } elseif ($Apply) { '执行' } else { '演练' }
 Write-Host "用户目录  $ProfileRoot"
 Write-Host "目标根    $TargetRoot"
@@ -160,6 +200,8 @@ foreach ($name in $Folders) {
 
         Remove-Junction -Path $old
         Move-Tree -Source $new -Target $old
+        $Migrated.Remove($name)
+        Write-Marker -Migrated $Migrated
         Say '已回滚' Green
         $Results.Add([pscustomobject]@{ 文件夹 = $name; 结果 = '已回滚' })
         continue
@@ -184,10 +226,24 @@ foreach ($name in $Folders) {
         continue
     }
 
-    if (-not $item -and -not (Test-Path -LiteralPath $new)) {
+    $targetExists = Test-Path -LiteralPath $new
+
+    if (-not $item -and -not $targetExists) {
         Say '新旧位置都不存在，跳过' DarkGray
         $Results.Add([pscustomobject]@{ 文件夹 = $name; 结果 = '跳过（未使用）' })
         continue
+    }
+
+    # 目标已存在时先分辨来路，认不出来就不往里灌数据
+    $ours = $Migrated.ContainsKey($name)
+    if ($targetExists -and -not $ours -and -not $AdoptExisting) {
+        $n = @(Get-ChildItem -LiteralPath $new -Force).Count
+        Say "$new 已存在（$n 项），不是本工具迁移的。确认要合并进去请加 -AdoptExisting" Yellow
+        $Results.Add([pscustomobject]@{ 文件夹 = $name; 结果 = '中止（目标已存在，来路不明）' })
+        continue
+    }
+    if ($targetExists -and $ours) {
+        Say "$new 是上次迁移留下的，按合并处理" DarkGray
     }
 
     $count = if ($item) { @(Get-ChildItem -LiteralPath $old -Force).Count } else { 0 }
@@ -209,13 +265,17 @@ foreach ($name in $Folders) {
             Remove-Item -LiteralPath $old -Force
         }
     }
-    elseif (-not (Test-Path -LiteralPath $new)) {
+    elseif (-not $targetExists) {
         $null = New-Item -ItemType Directory -Path $new -Force
     }
 
     if ($item -and (Test-Path -LiteralPath $old)) { Remove-Item -LiteralPath $old -Force }
     New-Junction -Path $old -Target $new
     if ($SyncShellFolders) { Set-ShellFolder -Name $name -Path $new }
+
+    # 每个目录迁完就落盘，中途出错也不至于让已迁的目录失去标记
+    $Migrated[$name] = (Get-Date).ToString('o')
+    Write-Marker -Migrated $Migrated
 
     Say "完成，$count 项已迁入" Green
     $Results.Add([pscustomobject]@{ 文件夹 = $name; 结果 = "已迁移（$count 项）" })
