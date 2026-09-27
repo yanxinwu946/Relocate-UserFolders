@@ -10,11 +10,11 @@
 
     默认只演练，确认无误再加 -Apply。
 
-.PARAMETER ProfileRoot
-    要处理的用户目录，默认当前用户。指定其他路径可迁移别的账户或做沙箱测试。
-
 .PARAMETER TargetRoot
     必填。目标根目录，每个文件夹落到 <TargetRoot>\<名称>。
+
+.PARAMETER ProfileRoot
+    要处理的用户目录，默认当前用户。指定其他路径可迁移别的账户或做沙箱测试。
 
 .PARAMETER Folders
     要迁移的文件夹名，默认六个标准用户目录。
@@ -32,7 +32,8 @@
 
 .PARAMETER SyncShellFolders
     顺带改写注册表 Shell Folders，让资源管理器属性页显示真实位置。
-    联接本身已覆盖所有路径解析，此开关纯粹为了界面一致，需重新登录生效。
+    联接本身已覆盖所有路径解析，此开关纯粹为了界面一致。
+    改完会广播 WM_SETTINGCHANGE 通知 shell，无需重新登录；-Undo 会一并还原。
 
 .EXAMPLE
     .\Relocate-UserFolders.ps1 -TargetRoot 'D:\'
@@ -65,6 +66,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Results = [System.Collections.Generic.List[object]]::new()
+$ShellChanged = $false
 
 $MarkerPath = Join-Path $TargetRoot '.relocate-userfolders.json'
 $driveRoot = [System.IO.Path]::GetPathRoot($TargetRoot)
@@ -130,13 +132,41 @@ function Set-ShellFolder {
     $base = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer'
     New-ItemProperty -Path "$base\User Shell Folders" -Name $value -Value $Path -PropertyType ExpandString -Force | Out-Null
     New-ItemProperty -Path "$base\Shell Folders" -Name $value -Value $Path -PropertyType String -Force | Out-Null
+    $script:ShellChanged = $true
+}
+
+# 改完注册表要主动通知，否则运行中的进程和资源管理器仍用缓存的旧路径
+function Send-ShellChange {
+    param([string]$Path)
+    if (-not ('RelocateUserFolders.Native' -as [type])) {
+        Add-Type -Namespace RelocateUserFolders -Name Native -MemberDefinition @'
+[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+
+[DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+public static extern void SHChangeNotify(int wEventId, uint uFlags, string dwItem1, string dwItem2);
+'@
+    }
+    $WM_SETTINGCHANGE = 0x1A
+    $SMTO_ABORTIFHUNG = 0x0002
+    $SHCNE_UPDATEITEM = 0x00002000
+    $SHCNF_PATHW = 0x0005
+
+    $result = [UIntPtr]::Zero
+    $null = [RelocateUserFolders.Native]::SendMessageTimeout([IntPtr]0xFFFF, $WM_SETTINGCHANGE, [UIntPtr]::Zero, 'ShellState', $SMTO_ABORTIFHUNG, 5000, [ref]$result)
+    [RelocateUserFolders.Native]::SHChangeNotify($SHCNE_UPDATEITEM, $SHCNF_PATHW, $Path, $null)
 }
 
 # 目标根下的标记文件，记下哪些目录是本工具迁的。目标位置已存在同名目录时，
 # 只有靠它才能分辨"上次迁移的残留"和"用户自己建的"，否则只能中止等人工确认。
 function Read-Marker {
     if (-not (Test-Path -LiteralPath $MarkerPath)) { return @{} }
-    $json = Get-Content -LiteralPath $MarkerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    try {
+        $json = Get-Content -LiteralPath $MarkerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        throw "标记文件解析失败，检查或删除后重跑：$MarkerPath"
+    }
     $table = @{}
     if ($json.migrated) {
         foreach ($p in $json.migrated.PSObject.Properties) { $table[$p.Name] = $p.Value }
@@ -146,19 +176,32 @@ function Read-Marker {
 
 function Write-Marker {
     param([hashtable]$Migrated)
-    [ordered]@{
+    $json = [ordered]@{
         version     = 1
         profileRoot = $ProfileRoot
         migrated    = $Migrated
-    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $MarkerPath -Encoding UTF8
+    } | ConvertTo-Json -Depth 4
+    # 先写临时文件再替换，中途中断也不会留下半截 JSON
+    $tmp = "$MarkerPath.tmp"
+    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
+    Move-Item -LiteralPath $tmp -Destination $MarkerPath -Force
 }
 
 $Migrated = Read-Marker
+
+# 注册表改的是当前用户的 HKCU，-ProfileRoot 指向别的账户时改它没有意义
+if ($SyncShellFolders -and $ProfileRoot -ne [Environment]::GetFolderPath('UserProfile')) {
+    Write-Host '提示：-ProfileRoot 不是当前用户，已忽略 -SyncShellFolders' -ForegroundColor Yellow
+    $SyncShellFolders = $false
+}
 
 $mode = if ($Undo) { '回滚' } elseif ($Apply) { '执行' } else { '演练' }
 Write-Host "用户目录  $ProfileRoot"
 Write-Host "目标根    $TargetRoot"
 Write-Host "模式      $mode" -ForegroundColor $(if ($Apply) { 'Yellow' } else { 'DarkGray' })
+if ($Migrated.Count) {
+    Write-Host "已标记    $((@($Migrated.Keys) | Sort-Object) -join ', ')"
+}
 
 foreach ($name in $Folders) {
     $old = Join-Path $ProfileRoot $name
@@ -202,6 +245,9 @@ foreach ($name in $Folders) {
         Move-Tree -Source $new -Target $old
         $Migrated.Remove($name)
         Write-Marker -Migrated $Migrated
+        # 注册表也退回默认值，否则回滚后 Known Folder API 仍指着已搬空的目标
+        if ($SyncShellFolders) { Set-ShellFolder -Name $name -Path "%USERPROFILE%\$name" }
+
         Say '已回滚' Green
         $Results.Add([pscustomobject]@{ 文件夹 = $name; 结果 = '已回滚' })
         continue
@@ -279,6 +325,11 @@ foreach ($name in $Folders) {
 
     Say "完成，$count 项已迁入" Green
     $Results.Add([pscustomobject]@{ 文件夹 = $name; 结果 = "已迁移（$count 项）" })
+}
+
+if ($ShellChanged -and $Apply) {
+    # 回滚后目标根可能已空，通知的是用户目录那边
+    Send-ShellChange -Path $(if ($Undo) { $ProfileRoot } else { $TargetRoot })
 }
 
 Write-Host "`n=== 汇总 ===" -ForegroundColor Cyan
